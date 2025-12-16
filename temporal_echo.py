@@ -1,251 +1,235 @@
 import streamlit as st
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import torch.optim as optim
 from torch.distributions import Normal
 import numpy as np
-import random
 import time
-import math
+import random
 from dataclasses import dataclass, field
-from typing import List, Tuple, Optional, Dict
-from collections import deque
+from typing import List, Tuple, Dict
 
 @dataclass
 class Config:
-    # Environment
+    # Physics / World
     room_size: float = 20.0
     agent_radius: float = 0.8
-    button_pos: Tuple[float, float] = (4.0, 16.0)
-    goal_pos: Tuple[float, float] = (16.0, 4.0)
-    barrier_x: float = 10.0  # Barrier acts as a wall at x=10
+    button_a_pos: np.ndarray = field(default_factory=lambda: np.array([5.0, 15.0]))
+    button_b_pos: np.ndarray = field(default_factory=lambda: np.array([15.0, 15.0]))
+    goal_pos: np.ndarray = field(default_factory=lambda: np.array([10.0, 2.0]))
+    barrier_y: float = 8.0
     
     # Training
     device: str = "cpu"
-    lr: float = 3e-4
+    lr: float = 0.0003
     gamma: float = 0.99
-    clip_epsilon: float = 0.2
+    clip_ratio: float = 0.2
+    value_coef: float = 0.5
     entropy_coef: float = 0.01
-    value_loss_coef: float = 0.5
     max_grad_norm: float = 0.5
-    hidden_dim: int = 128
+    
+    # Model Architecture
+    hidden_dim: int = 64
     
     # Simulation
-    max_steps: int = 100
-    cycles_per_epoch: int = 10
-    
+    max_steps: int = 80
+    train_iterations: int = 5
     seed: int = 42
 
     def __post_init__(self):
-        if torch.cuda.is_available(): self.device = "cuda"
-        elif torch.backends.mps.is_available(): self.device = "cpu"
+        if torch.cuda.is_available():
+            self.device = "cuda"
 
 cfg = Config()
 
-def set_seed(seed: int):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-
 class TemporalEnv:
     """
-    A custom environment supporting Time Loops.
-    State: [agent_x, agent_y, ghost_x, ghost_y, button_pressed, barrier_open]
-    Action: [velocity_x, velocity_y] (continuous)
+    Environment with 'Time Travel' mechanics.
+    Goal: Open the door by pressing Button A and Button B simultaneously.
+    Problem: There is only one agent.
+    Solution: Cooperative play with a recorded 'Ghost' from a previous timeline.
     """
-    def __init__(self, cfg: Config):
-        self.cfg = cfg
-        self.state = None
+    def __init__(self, config: Config):
+        self.cfg = config
         self.steps = 0
-        self.ghost_trajectory: List[Tuple[float, float]] = []
-        self.history: List[Tuple[float, float]] = []
+        self.agent_pos = np.array([10.0, 18.0], dtype=np.float32)
+        self.ghost_pos = np.array([-10.0, -10.0], dtype=np.float32)
+        self.ghost_traj = []
         self.has_ghost = False
+        self.ghost_idx = 0
 
-    def reset(self, ghost_trajectory: Optional[List[Tuple[float, float]]] = None):
+    def reset(self, ghost_trajectory: List[np.ndarray] = None):
         self.steps = 0
-        self.agent_pos = np.array([2.0, 2.0], dtype=np.float32)
-        self.history = []
+        self.agent_pos = np.array([10.0, 18.0], dtype=np.float32)
         
         if ghost_trajectory is not None and len(ghost_trajectory) > 0:
-            self.ghost_trajectory = ghost_trajectory
+            self.ghost_traj = ghost_trajectory
             self.has_ghost = True
-            self.ghost_pos = np.array(self.ghost_trajectory[0], dtype=np.float32)
+            self.ghost_idx = 0
+            self.ghost_pos = self.ghost_traj[0]
         else:
-            self.ghost_trajectory = []
+            self.ghost_traj = []
             self.has_ghost = False
-            self.ghost_pos = np.array([-5.0, -5.0], dtype=np.float32)
-
+            self.ghost_pos = np.array([-10.0, -10.0], dtype=np.float32)
+            
         return self._get_obs()
 
     def _get_obs(self):
-        # Normalize observations to [-1, 1] range roughly for neural net stability
         s = self.cfg.room_size
-        return np.array([
-            self.agent_pos[0] / s,
-            self.agent_pos[1] / s,
-            self.ghost_pos[0] / s,
-            self.ghost_pos[1] / s,
-            1.0 if self._is_button_pressed() else 0.0,
-            1.0 if self._is_barrier_open() else 0.0
+        obs = np.array([
+            self.agent_pos[0] / s, self.agent_pos[1] / s,
+            self.ghost_pos[0] / s, self.ghost_pos[1] / s,
+            1.0 if self._is_pressed(self.cfg.button_a_pos) else 0.0,
+            1.0 if self._is_pressed(self.cfg.button_b_pos) else 0.0
         ], dtype=np.float32)
+        return obs
 
-    def _is_button_pressed(self):
-        d_agent = np.linalg.norm(self.agent_pos - np.array(self.cfg.button_pos))
-        d_ghost = np.linalg.norm(self.ghost_pos - np.array(self.cfg.button_pos))
-        radius = 2.0
-        return d_agent < radius or d_ghost < radius
+    def _is_pressed(self, btn_pos):
+        da = np.linalg.norm(self.agent_pos - btn_pos)
+        dg = np.linalg.norm(self.ghost_pos - btn_pos)
+        return da < 1.5 or dg < 1.5
 
-    def _is_barrier_open(self):
-        return self._is_button_pressed()
-
-    def step(self, action: np.ndarray):
+    def step(self, action):
         self.steps += 1
-        
-        # 1. Update Ghost Position
         if self.has_ghost:
-            idx = min(self.steps, len(self.ghost_trajectory) - 1)
-            self.ghost_pos = np.array(self.ghost_trajectory[idx])
-        
-        # 2. Apply Action
-        # Action is velocity [-1, 1] -> scale to speed
-        vel = np.clip(action, -1.0, 1.0) * 1.5 
-        new_pos = self.agent_pos + vel
+            if self.ghost_idx < len(self.ghost_traj):
+                self.ghost_pos = self.ghost_traj[self.ghost_idx]
+                self.ghost_idx += 1
+            else:
+                self.ghost_pos = self.ghost_traj[-1]
 
-        # 3. Collision Logic
-        # Bounds
+        # Action is [vel_x, vel_y] clamped to [-1, 1]
+        velocity = np.clip(action, -1.0, 1.0) * 1.2
+        new_pos = self.agent_pos + velocity
+        
         new_pos = np.clip(new_pos, 0, self.cfg.room_size)
-        
-        # Barrier Logic
-        # Barrier is at x=10. If not open, you cannot cross x=10.
-        barrier_open = self._is_barrier_open()
-        
-        # Check if we are trying to cross the barrier line
-        crossed_barrier = (self.agent_pos[0] <= self.cfg.barrier_x and new_pos[0] > self.cfg.barrier_x) or \
-                          (self.agent_pos[0] >= self.cfg.barrier_x and new_pos[0] < self.cfg.barrier_x)
-        
-        if crossed_barrier and not barrier_open:
-            # Hit the wall, slide along y
-            new_pos[0] = self.agent_pos[0] 
-        
+        door_open = self._is_pressed(self.cfg.button_a_pos) and self._is_pressed(self.cfg.button_b_pos)
+
+        if not door_open:
+            crossing_down = self.agent_pos[1] >= self.cfg.barrier_y and new_pos[1] < self.cfg.barrier_y
+            crossing_up = self.agent_pos[1] <= self.cfg.barrier_y and new_pos[1] > self.cfg.barrier_y
+            
+            if crossing_down or crossing_up:
+                new_pos[1] = self.agent_pos[1]
+
         self.agent_pos = new_pos
-        self.history.append(tuple(self.agent_pos))
 
-        # 4. Rewards
-        reward = -0.01 # Time penalty
+        reward = -0.01
         done = False
-
-        # Distance to goal reward
-        dist_to_goal = np.linalg.norm(self.agent_pos - np.array(self.cfg.goal_pos))
-        reward += (1.0 - dist_to_goal / self.cfg.room_size) * 0.1
-
-        # Button reward (incentivize pressing button if goal is far/blocked)
-        if self._is_button_pressed():
-            reward += 0.05
         
-        # Goal Achievement
+        dist_to_goal = np.linalg.norm(self.agent_pos - self.cfg.goal_pos)
+
+        if self._is_pressed(self.cfg.button_a_pos): reward += 0.02
+        if self._is_pressed(self.cfg.button_b_pos): reward += 0.02
+
         if dist_to_goal < 1.5:
             reward += 10.0
             done = True
         
         if self.steps >= self.cfg.max_steps:
             done = True
-
+            
         return self._get_obs(), reward, done, {}
 
-class ActorCritic(nn.Module):
-    def __init__(self, obs_dim, action_dim, hidden_dim=64):
+# MODEL: RECURRENT PPO (LSTM)
+class RecurrentActorCritic(nn.Module):
+    def __init__(self, obs_dim, act_dim, hidden_dim):
         super().__init__()
-        self.net = nn.Sequential(
+        self.hidden_dim = hidden_dim
+        
+        self.fc_body = nn.Sequential(
             nn.Linear(obs_dim, hidden_dim),
-            nn.Tanh(),
-            nn.Linear(hidden_dim, hidden_dim),
             nn.Tanh()
         )
-        
-        # Actor: outputs mean of action distribution
-        self.actor_mean = nn.Linear(hidden_dim, action_dim)
-        # Actor: learnable log standard deviation
-        self.actor_log_std = nn.Parameter(torch.zeros(1, action_dim))
-        
-        # Critic: outputs value estimate
+
+        self.lstm = nn.LSTMCell(hidden_dim, hidden_dim)
+
+        self.actor = nn.Linear(hidden_dim, act_dim)
         self.critic = nn.Linear(hidden_dim, 1)
+        self.log_std = nn.Parameter(torch.zeros(1, act_dim))
+
+    def forward(self, x, hx, cx):
+        x = self.fc_body(x)
+        hx_new, cx_new = self.lstm(x, (hx, cx))
+        return hx_new, cx_new
+
+    def get_action(self, x, hx, cx):
+        h_out, c_out = self.forward(x, hx, cx)
         
-        for layer in [self.actor_mean, self.critic]:
-            nn.init.orthogonal_(layer.weight, gain=1.0)
-            nn.init.constant_(layer.bias, 0.0)
-
-    def forward(self, x):
-        features = self.net(x)
-        return features
-
-    def get_action(self, x):
-        features = self.forward(x)
-        mean = self.actor_mean(features)
-        std = self.actor_log_std.exp().expand_as(mean)
+        mean = self.actor(h_out)
+        std = self.log_std.exp().expand_as(mean)
         dist = Normal(mean, std)
+        
         action = dist.sample()
         log_prob = dist.log_prob(action).sum(dim=-1)
-        return action, log_prob, self.critic(features), dist
-
-    def get_value(self, x):
-        return self.critic(self.forward(x))
+        value = self.critic(h_out)
+        
+        return action, log_prob, value, h_out, c_out
 
 class PPOAgent:
-    def __init__(self, cfg: Config):
-        self.cfg = cfg
-        self.model = ActorCritic(obs_dim=6, action_dim=2, hidden_dim=cfg.hidden_dim).to(cfg.device)
-        self.optimizer = optim.Adam(self.model.parameters(), lr=cfg.lr)
+    def __init__(self, config: Config):
+        self.cfg = config
+        self.model = RecurrentActorCritic(6, 2, config.hidden_dim).to(config.device)
+        self.optimizer = optim.Adam(self.model.parameters(), lr=config.lr)
         self.memory = []
-
+    
     def store(self, transition):
+        # transition: (obs, h, c, action, log_prob, reward, done)
         self.memory.append(transition)
 
-    def update(self):
+    def finish_episode(self):
         if not self.memory: return 0.0
+        obs_lst, h_lst, c_lst, act_lst, lp_lst, rew_lst, done_lst = zip(*self.memory)
         
-        states, actions, old_log_probs, rewards, dones, values = zip(*self.memory)
-
-        states = torch.stack(states)
-        actions = torch.stack(actions)
-        old_log_probs = torch.stack(old_log_probs)
-        rewards = torch.tensor(rewards, dtype=torch.float32).to(self.cfg.device)
-        dones = torch.tensor(dones, dtype=torch.float32).to(self.cfg.device)
-        values = torch.cat(values).squeeze()
-
-        advantages = []
-        gae = 0
-        with torch.no_grad():
-            next_value = 0
-            for i in reversed(range(len(rewards))):
-                mask = 1.0 - dones[i]
-                delta = rewards[i] + self.cfg.gamma * next_value * mask - values[i]
-                gae = delta + self.cfg.gamma * 0.95 * mask * gae
-                advantages.insert(0, gae)
-                next_value = values[i]
+        obs = torch.stack(obs_lst).to(self.cfg.device)
+        h_ins = torch.stack(h_lst).detach().to(self.cfg.device).squeeze(1)
+        c_ins = torch.stack(c_lst).detach().to(self.cfg.device).squeeze(1)
+        actions = torch.stack(act_lst).to(self.cfg.device)
+        old_log_probs = torch.stack(lp_lst).to(self.cfg.device)
+        rewards = torch.tensor(rew_lst, dtype=torch.float32).to(self.cfg.device)
         
-        advantages = torch.tensor(advantages, dtype=torch.float32).to(self.cfg.device)
-        returns = advantages + values
+        returns = []
+        G = 0
+        for r in reversed(rewards):
+            G = r + self.cfg.gamma * G
+            returns.insert(0, G)
+        returns = torch.tensor(returns, dtype=torch.float32).to(self.cfg.device)
+        returns = (returns - returns.mean()) / (returns.std() + 1e-8)
 
         total_loss = 0
         for _ in range(4):
-            features = self.model(states)
-            mean = self.model.actor_mean(features)
-            std = self.model.actor_log_std.exp().expand_as(mean)
-            dist = Normal(mean, std)
-            
-            new_log_probs = dist.log_prob(actions).sum(dim=-1)
-            entropy = dist.entropy().sum(dim=-1).mean()
-            new_values = self.model.critic(features).squeeze()
+            h, c = h_ins[0].unsqueeze(0), c_ins[0].unsqueeze(0)
 
-            ratio = (new_log_probs - old_log_probs).exp()
-            surr1 = ratio * advantages
-            surr2 = torch.clamp(ratio, 1.0 - self.cfg.clip_epsilon, 1.0 + self.cfg.clip_epsilon) * advantages
+            curr_log_probs = []
+            curr_values = []
+
+            h_curr, c_curr = h_ins[0].unsqueeze(0), c_ins[0].unsqueeze(0)
+            
+            for t in range(len(obs)):
+                h_curr, c_curr = self.model.forward(obs[t].unsqueeze(0), h_curr, c_curr)
+
+                mean = self.model.actor(h_curr)
+                std = self.model.log_std.exp().expand_as(mean)
+                dist = Normal(mean, std)
+                lp = dist.log_prob(actions[t]).sum(-1)
+                val = self.model.critic(h_curr)
+                
+                curr_log_probs.append(lp)
+                curr_values.append(val)
+                
+            curr_log_probs = torch.stack(curr_log_probs).squeeze()
+            curr_values = torch.stack(curr_values).squeeze()
+
+            ratio = torch.exp(curr_log_probs - old_log_probs)
+            advantage = returns - curr_values.detach()
+            
+            surr1 = ratio * advantage
+            surr2 = torch.clamp(ratio, 1.0 - self.cfg.clip_ratio, 1.0 + self.cfg.clip_ratio) * advantage
             
             actor_loss = -torch.min(surr1, surr2).mean()
-            critic_loss = F.mse_loss(new_values, returns)
+            critic_loss = nn.MSELoss()(curr_values, returns)
             
-            loss = actor_loss + self.cfg.value_loss_coef * critic_loss - self.cfg.entropy_coef * entropy
+            loss = actor_loss + self.cfg.value_coef * critic_loss
             
             self.optimizer.zero_grad()
             loss.backward()
@@ -256,197 +240,190 @@ class PPOAgent:
         self.memory = []
         return total_loss
 
-def render_env(env: TemporalEnv, container):
-    scale = 20
-    canvas_size = int(env.cfg.room_size * scale)
+def render_svg(env: TemporalEnv, phase_text: str):
+    s = 20
+    W = int(env.cfg.room_size * s)
+    H = int(env.cfg.room_size * s)
+    
+    def to_px(pos): return int(pos[0]*s), int(H - pos[1]*s)
+    
+    ax, ay = to_px(env.agent_pos)
+    gx, gy = to_px(env.ghost_pos)
+    bax, bay = to_px(env.cfg.button_a_pos)
+    bbx, bby = to_px(env.cfg.button_b_pos)
+    gox, goy = to_px(env.cfg.goal_pos)
+    bar_y_px = int(H - env.cfg.barrier_y * s)
 
-    def to_px(x, y):
-        return int(x * scale), int(canvas_size - y * scale)
-
-    ax, ay = to_px(*env.agent_pos)
-    gx, gy = to_px(*env.ghost_pos)
-    bx, by = to_px(*env.cfg.button_pos)
-    glx, gly = to_px(*env.cfg.goal_pos)
-
-    barrier_x_px = int(env.cfg.barrier_x * scale)
-
-    agent_col = "#3498db" # Blue
-    ghost_col = "rgba(100, 100, 100, 0.5)" # Translucent Grey
-    button_col = "#e74c3c" if not env._is_button_pressed() else "#2ecc71" # Red -> Green
-    barrier_col = "#ffffff" if not env._is_barrier_open() else "rgba(255,255,255, 0.1)"
-    goal_col = "#f1c40f" # Gold
-
+    c_bg = "#1e1e2e"
+    c_btn_a = "#ff5555" if not env._is_pressed(env.cfg.button_a_pos) else "#50fa7b"
+    c_btn_b = "#8be9fd" if not env._is_pressed(env.cfg.button_b_pos) else "#50fa7b"
+    c_agent = "#ff79c6"
+    c_ghost = "rgba(189, 147, 249, 0.4)"
+    
+    door_open = env._is_pressed(env.cfg.button_a_pos) and env._is_pressed(env.cfg.button_b_pos)
+    door_stroke = "none" if door_open else "white"
+    
     svg = f"""
-    <svg width="{canvas_size}" height="{canvas_size}" style="background-color: #2c3e50; border-radius: 8px;">
-        <defs>
-            <pattern id="grid" width="40" height="40" patternUnits="userSpaceOnUse">
-                <path d="M 40 0 L 0 0 0 40" fill="none" stroke="rgba(255,255,255,0.05)" stroke-width="1"/>
-            </pattern>
-        </defs>
-        <rect width="100%" height="100%" fill="url(#grid)" />
+    <svg width="{W}" height="{H}" style="background-color: {c_bg}; border-radius: 8px; border: 2px solid #6272a4;">
+        <text x="10" y="25" fill="#6272a4" font-family="monospace" font-weight="bold">{phase_text}</text>
 
-        <line x1="{barrier_x_px}" y1="0" x2="{barrier_x_px}" y2="{canvas_size}" 
-              stroke="{barrier_col}" stroke-width="6" stroke-dasharray="{'none' if not env._is_barrier_open() else '10,10'}" />
-
-        <circle cx="{bx}" cy="{by}" r="15" fill="{button_col}" stroke="white" stroke-width="2" />
-        <text x="{bx}" y="{by+35}" fill="white" font-family="monospace" font-size="12" text-anchor="middle">TIME LOCK</text>
-
-        <circle cx="{glx}" cy="{gly}" r="20" fill="{goal_col}" stroke="white" stroke-width="2">
-            <animate attributeName="r" values="20;25;20" dur="2s" repeatCount="indefinite" />
-        </circle>
-        <text x="{glx}" y="{gly+40}" fill="{goal_col}" font-family="monospace" font-size="14" text-anchor="middle" font-weight="bold">EXIT</text>
-
-        <circle cx="{gx}" cy="{gy}" r="12" fill="{ghost_col}" stroke="#bdc3c7" stroke-width="1" stroke-dasharray="2,2" />
-        <text x="{gx}" y="{gy-20}" fill="#bdc3c7" font-family="monospace" font-size="10" text-anchor="middle">ECHO</text>
-
-        <circle cx="{ax}" cy="{ay}" r="12" fill="{agent_col}" stroke="white" stroke-width="2" />
-        <text x="{ax}" y="{ay-20}" fill="white" font-family="monospace" font-size="10" text-anchor="middle">YOU</text>
+        <line x1="0" y1="{bar_y_px}" x2="{W}" y2="{bar_y_px}" stroke="{door_stroke}" stroke-width="6" stroke-dasharray="10, 5" />
         
+        <circle cx="{gox}" cy="{goy}" r="25" fill="none" stroke="#f1fa8c" stroke-width="2" stroke-dasharray="4,2">
+             <animateTransform attributeName="transform" type="rotate" from="0 {gox} {goy}" to="360 {gox} {goy}" dur="10s" repeatCount="indefinite"/>
+        </circle>
+        <text x="{gox}" y="{goy+5}" fill="#f1fa8c" text-anchor="middle" font-family="Arial" font-size="12">EXIT</text>
+
+        <circle cx="{bax}" cy="{bay}" r="15" fill="{c_btn_a}" stroke="white" stroke-width="2"/>
+        <text x="{bax}" y="{bay+5}" fill="black" text-anchor="middle" font-weight="bold" font-family="Arial" font-size="12">A</text>
+        
+        <circle cx="{bbx}" cy="{bby}" r="15" fill="{c_btn_b}" stroke="white" stroke-width="2"/>
+        <text x="{bbx}" y="{bby+5}" fill="black" text-anchor="middle" font-weight="bold" font-family="Arial" font-size="12">B</text>
+
+        <g>
+            <circle cx="{gx}" cy="{gy}" r="12" fill="{c_ghost}" stroke="#bd93f9" stroke-width="1" stroke-dasharray="2,2" />
+        </g>
+
+        <circle cx="{ax}" cy="{ay}" r="12" fill="{c_agent}" stroke="white" stroke-width="2" />
+        
+        <line x1="{ax}" y1="{ay}" x2="{gx}" y2="{gy}" stroke="rgba(255,255,255,0.1)" stroke-width="1" />
     </svg>
     """
-    container.markdown(svg, unsafe_allow_html=True)
-
-def generate_agent_thought(value: float, button_pressed: bool, barrier_open: bool, loop_phase: int):
-    if loop_phase == 1:
-        if value < 0: return "Can't reach the exit. The wall is blocking me."
-        if not button_pressed: return "Maybe I should press that button to help my future self?"
-        return "Holding the button. Hope the echo works in the next loop."
-    else:
-        if not barrier_open: return "Waiting for my past self to press the button..."
-        if barrier_open: return "The wall is gone! Thanks, past me. Running to exit!"
-        return "Syncing with timeline..."
+    return svg
 
 def main():
-    st.set_page_config(page_title="Project Temporal Echo", layout="wide", page_icon="⏳")
+    st.set_page_config(page_title="Temporal Echo AI", layout="wide", page_icon="📼")
     
-    st.title("⏳ Temporal Echo: Deep RL with Time Loops")
+    # Custom CSS for "VHS" aesthetic
     st.markdown("""
-    **Concept:** An AI agent needs to escape a room. The door is locked by a button. 
-    The catch? The button must be held to keep the door open, but the agent is alone.
-    
-    **Solution:** The agent enters a **Time Loop**.
-    1.  **Loop 1 (The Sacrifice):** Agent learns to press the button, even though it can't exit.
-    2.  **Loop 2 (The Escape):** The agent plays alongside a "Ghost" recording of Loop 1. The Ghost holds the button, the Agent escapes.
+    <style>
+    .stApp { background-color: #0e0e11; color: #dcdcdc; }
+    h1 { color: #ff79c6; text-shadow: 2px 2px #bd93f9; }
+    </style>
+    """, unsafe_allow_html=True)
+
+    st.title("📼 Project Temporal Echo")
+    st.markdown("""
+    **The Puzzle:** To exit, **Button A** and **Button B** must be pressed *simultaneously*.
+    **The Problem:** You are alone.
+    **The Solution:** Record your actions in Timeline 1 (Ghost), then cooperate with your past self in Timeline 2.
     """)
-    
+
     with st.sidebar:
-        st.header("Hyperparameters")
-        train_speed = st.slider("Training Speed (Cycles/Step)", 1, 50, 10)
-        lr_input = st.selectbox("Learning Rate", [1e-3, 3e-4, 1e-4], index=1)
-        st.caption("Lower LR = More stable, slower learning")
-        
-        if st.button("Reset Model"):
+        st.header("Control Panel")
+        if st.button("Reset Brain (Clear Model)", type="primary"):
             st.session_state.agent = PPOAgent(cfg)
-            st.session_state.rewards_history = []
-            st.session_state.epoch = 0
+            st.session_state.history = []
             st.rerun()
-            
-    if 'agent' not in st.session_state:
-        set_seed(cfg.seed)
-        st.session_state.agent = PPOAgent(cfg)
-        st.session_state.rewards_history = []
-        st.session_state.epoch = 0
-        st.session_state.best_ghost = []
-
-    agent = st.session_state.agent
-    env = TemporalEnv(cfg)
-    
-    col_viz, col_stats = st.columns([1.5, 1])
-
-    with col_viz:
-        viz_container = st.empty()
-        thought_bubble = st.empty()
         
-    with col_stats:
-        st.subheader("Neural Network Metrics")
-        chart_rewards = st.empty()
-        status_text = st.empty()
-        st.markdown("---")
-        st.markdown("**Live Logic Viz:**")
-        logic_col1, logic_col2 = st.columns(2)
-        metric_btn = logic_col1.empty()
-        metric_door = logic_col2.empty()
+        st.info("Architecture: LSTM-PPO\nContext: Temporal Self-Attention")
 
-    start_btn = st.button("▶ Start Time Loop Simulation")
+    if 'agent' not in st.session_state:
+        st.session_state.agent = PPOAgent(cfg)
+        st.session_state.history = []
+        
+    env = TemporalEnv(cfg)
+    agent = st.session_state.agent
 
-    if start_btn:
+    col1, col2 = st.columns([1.5, 1])
+    
+    with col1:
+        st.subheader("Live Simulation")
+        screen = st.empty()
+        overlay = st.empty()
+
+        screen.markdown(render_svg(env, "WAITING FOR START..."), unsafe_allow_html=True)
+
+    with col2:
+        st.subheader("Neural Training Metrics")
+        chart_loss = st.empty()
+        metrics_container = st.container()
+        chart_loss.line_chart([0])
+        
+        with metrics_container:
+            m1, m2 = st.columns(2)
+            m1.metric("Timeline 1 Reward", "0.00")
+            m2.metric("Timeline 2 Reward", "0.00")
+
+    if st.button("▶ START TEMPORAL LOOP"):
         progress_bar = st.progress(0)
         
-        for cycle in range(train_speed): 
+        for epoch in range(cfg.train_iterations):
+            
+            # Agent tries to press Button A to help future self.
+            # Ghost is inactive/empty here.
+            
             obs = env.reset(ghost_trajectory=[])
-            done = False
-            traj_1 = []
-            ep_reward_1 = 0
+            h = torch.zeros(1, cfg.hidden_dim).to(cfg.device)
+            c = torch.zeros(1, cfg.hidden_dim).to(cfg.device)
             
-            while not done:
-                obs_t = torch.tensor(obs, dtype=torch.float32).to(cfg.device).unsqueeze(0)
-                action, log_prob, val, _ = agent.model.get_action(obs_t)
+            traj_1_pos = []
+            r1_total = 0
+            
+            for t in range(cfg.max_steps):
+                obs_t = torch.tensor(obs, dtype=torch.float32).unsqueeze(0).to(cfg.device)
+
+                with torch.no_grad():
+                    action, log_prob, _, h_new, c_new = agent.model.get_action(obs_t, h, c)
+
                 act_np = action.cpu().numpy()[0]
                 next_obs, reward, done, _ = env.step(act_np)
-                agent.store((obs_t, action, log_prob, reward, done, val))
-                
-                traj_1.append(tuple(env.agent_pos))
-                ep_reward_1 += reward
-                obs = next_obs
-            loss_1 = agent.update()
-            did_press = any([np.linalg.norm(np.array(p) - np.array(cfg.button_pos)) < 2.0 for p in traj_1])
-            
-            if did_press:
-                active_ghost = traj_1
-            else:
-                active_ghost = [] # Ghost failed, so we are alone again
 
-            obs = env.reset(ghost_trajectory=active_ghost)
-            done = False
-            ep_reward_2 = 0
-            render_this_cycle = (cycle == train_speed - 1)
+                agent.store((obs_t.squeeze(0), h, c, action.squeeze(0), log_prob, reward, done))
+
+                traj_1_pos.append(env.agent_pos.copy())
+
+                obs = next_obs
+                h, c = h_new, c_new
+                r1_total += reward
+                
+                if done: break
             
-            while not done:
-                obs_t = torch.tensor(obs, dtype=torch.float32).to(cfg.device).unsqueeze(0)
-                action, log_prob, val, _ = agent.model.get_action(obs_t)
+            loss1 = agent.finish_episode()
+
+            if epoch % 2 == 0:
+                overlay.info("⏪ REWINDING REALITY...")
+                time.sleep(0.1)
+                overlay.empty()
+
+            # Agent cooperates with Ghost (traj_1_pos)
+            obs = env.reset(ghost_trajectory=traj_1_pos)
+            h = torch.zeros(1, cfg.hidden_dim).to(cfg.device)
+            c = torch.zeros(1, cfg.hidden_dim).to(cfg.device)
+            r2_total = 0
+            
+            for t in range(cfg.max_steps):
+                obs_t = torch.tensor(obs, dtype=torch.float32).unsqueeze(0).to(cfg.device)
+                
+                with torch.no_grad():
+                    action, log_prob, _, h_new, c_new = agent.model.get_action(obs_t, h, c)
                 
                 act_np = action.cpu().numpy()[0]
                 next_obs, reward, done, _ = env.step(act_np)
                 
-                agent.store((obs_t, action, log_prob, reward, done, val))
-                ep_reward_2 += reward
+                agent.store((obs_t.squeeze(0), h, c, action.squeeze(0), log_prob, reward, done))
+                
                 obs = next_obs
+                h, c = h_new, c_new
+                r2_total += reward
 
-                if render_this_cycle:
-                    render_env(env, viz_container)
-
-                    metric_btn.metric("Button Status", "PRESSED" if env._is_button_pressed() else "Released", 
-                                      delta_color="normal" if env._is_button_pressed() else "off")
-                    metric_door.metric("Door Status", "OPEN" if env._is_barrier_open() else "LOCKED",
-                                       delta="GO!" if env._is_barrier_open() else None)
-                    
-                    # Thoughts
-                    t_text = generate_agent_thought(val.item(), env._is_button_pressed(), env._is_barrier_open(), 2 if active_ghost else 1)
-                    thought_bubble.info(f"🧠 Agent Thought: *\"{t_text}\"*")
-                    
+                if epoch == cfg.train_iterations - 1:
+                    svg = render_svg(env, f"TIMELINE 2 | STEP {t}")
+                    screen.markdown(svg, unsafe_allow_html=True)
                     time.sleep(0.02)
+                
+                if done: break
 
-            loss_2 = agent.update()
+            loss2 = agent.finish_episode()
 
-            total_score = ep_reward_1 + ep_reward_2
-            st.session_state.rewards_history.append(total_score)
-            st.session_state.epoch += 1
-            progress_bar.progress((cycle + 1) / train_speed)
+            st.session_state.history.append(r2_total)
+            progress_bar.progress((epoch+1) / cfg.train_iterations)
 
-        if len(st.session_state.rewards_history) > 0:
-            rh = st.session_state.rewards_history
-            # Moving Average
-            ma = np.convolve(rh, np.ones(10)/10, mode='valid')
-            chart_rewards.line_chart(ma if len(ma) > 0 else rh)
-            
-        status_text.markdown(f"""
-        **Status Report:**
-        - Epoch: `{st.session_state.epoch}`
-        - Last Total Reward: `{total_score:.2f}`
-        - Ghost Active: `{'YES' if did_press else 'NO (Loop 1 failed)'}`
-        """)
+        chart_loss.line_chart(st.session_state.history)
+        m1.metric("Timeline 1 Reward", f"{r1_total:.2f}")
+        m2.metric("Timeline 2 Reward", f"{r2_total:.2f}", delta="SOLVED" if r2_total > 5.0 else None)
         
-        st.success("Simulation Batch Complete. Press Start to continue training.")
+        st.success("Temporal Convergence Complete. Agent memory updated.")
 
 if __name__ == "__main__":
     main()

@@ -71,3 +71,7 @@ The policy is an Actor-Critic architecture:
   * **Shared Net:** 2x fully connected layers with Tanh activation.
   * **Actor (Policy):** Outputs the mean and standard deviation for the 2D action vector (velocity).
   * **Critic (Value):** Estimates the expected cumulative reward (Value function).
+
+## License
+
+This project is open-source and available under the MIT License.

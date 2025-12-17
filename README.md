@@ -51,7 +51,7 @@ pip install -r requirements.txt
 Execute the Streamlit application from your terminal:
 
 ```bash
-streamlit run temporal_echo.py
+streamlit run temporal_echo.py -- --web
 ```
 
 The application will open in your browser, where you can start the simulation and watch the Agent evolve its strategy in real-time.

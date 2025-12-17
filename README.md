@@ -1,76 +1,115 @@
-# ⏳ Temporal Echo: Deep RL with Time Loops
+## ⏳ Temporal Echo: Deep RL with Time Loops
 
-A unique reinforcement learning project demonstrating **Temporal Self-Cooperation** - where a single agent learns to cooperate with a "Ghost" of its past self to solve an unsolvable physical paradox.
+**Temporal Echo** is an experimental reinforcement-learning project that studies cooperative behavior across time: a single agent records a past trajectory (a "ghost") and then must cooperate with that ghost in a later timeline to solve a puzzle - pressing two buttons simultaneously to open a door.
 
-This project is implemented entirely in Python and uses a custom **Proximal Policy Optimization (PPO)** algorithm within a bespoke 2D physics environment visualized by Streamlit.
+This repository contains a Streamlit demo and a minimal LSTM + PPO implementation with several practical stability improvements (GAE, entropy bonus, advantage normalization) and a rasterized visualization for live animations.
+
+---
 
 ## 💡 The Core Paradox
 
-The environment, known as the "Paradox Room," presents a classical problem:
+A classic coordination paradox: two buttons must be pressed simultaneously to open the exit, but only one agent exists. The only way to solve the puzzle is to *cooperate with your past self*: first record a trajectory where the agent presses Button A, then rewind time, spawn a ghost that replays that recorded trajectory, and in the second pass press Button B while the ghost holds Button A.
 
-* **Goal:** Reach the EXIT on the right side of the room.
-* **Obstacle:** A barrier separates the Agent from the EXIT.
-* **Solution:** A button must be *pressed and held* to open the barrier.
+This setting yields a challenging sparse-reward RL problem with a temporal dependence between episodes.
 
-Since the Agent is alone, it cannot press the button and pass through the opened door simultaneously.
+---
 
 ## 🧠 Solution: Temporal Self-Cooperation
 
-The Agent learns to solve this by entering a two-phase **Time Loop**:
+The reference implementation uses:
 
-1.  **Phase 1 (The Sacrifice):** The Agent, knowing the goal is unreachable, learns the most beneficial action for the *system* - to run to the button and hold it until the episode ends. This trajectory is recorded.
-2.  **Phase 2 (The Escape):** The recorded trajectory from Phase 1 is spawned as a translucent **"Echo" (Ghost)**. The Ghost runs and holds the button, opening the barrier for the Agent in the present loop to run straight to the EXIT.
+* **Policy**: RecurrentActorCritic (fully connected body → LSTMCell) producing Gaussian continuous actions.
+* **Algorithm**: PPO with Generalized Advantage Estimation (GAE), advantage normalization, entropy bonus, and multiple PPO epochs per collected trajectory.
+* **Training loop**: two-phase loop per epoch - (1) record a trajectory (Timeline 1), (2) reset environment with the recorded ghost and act in Timeline 2. Both trajectories are used to update the policy.
 
-The PPO algorithm is trained on the combined reward of both phases, forcing the policy to find a solution that prioritizes long-term, multi-temporal planning over immediate gain.
+Key practical improvements included:
 
-## 🛠️ Key Technical Features
+* GAE (lower variance advantages).
+* Entropy regularization to encourage exploration.
+* Reward shaping (dense small bonuses for pressing buttons and an extra bonus for simultaneous presses) while preserving the large final reward for reaching the exit.
+* Careful tensor shape handling and `.detach()` to avoid autograd leaks.
 
-* **Custom PPO Implementation:** The project includes a full, native implementation of the PPO algorithm (including GAE and Clipped Surrogate Objective) using PyTorch, without relying on external RL frameworks like Stable Baselines.
-* **Continuous Control:** The Agent uses a Gaussian Policy (Normal Distribution) to output continuous velocity vectors (Ax, Ay), making the control challenging and precise.
-* **Lightweight Physics Engine:** The environment uses NumPy for efficient 2D collision and movement logic.
-* **State-of-the-Art Visualization (Streamlit):** The interactive UI provides real-time rendering using SVG for high-performance visuals on CPU, along with dynamic metrics and an **Agent Thought Bubble** that displays the model's inner monologue and planning status.
+---
 
 ## 🚀 Getting Started
 
-### Prerequisites
+### Requirements
 
-You need Python 3.8+ installed.
+A `requirements.txt` file is provided in this repo. Recommended Python versions: **3.8 - 3.11**. GPU recommended for faster training but not required.
 
-### Installation
-
-Clone the repository and install the dependencies:
+### Install
 
 ```bash
 git clone https://github.com/Ant1pozitive/temporal-echo.git
 cd temporal_echo
+
+python -m venv .venv
+source .venv/bin/activate      # macOS / Linux
+.venv\Scripts\activate       # Windows (PowerShell: .venv\Scripts\Activate.ps1)
+
 pip install -r requirements.txt
-````
+```
 
-### Running the Simulation
+If you want GPU acceleration, install a PyTorch build that matches your CUDA toolkit. Example (Linux):
 
-Execute the Streamlit application from your terminal:
+```bash
+# visit https://pytorch.org for the correct CUDA build selector
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
+```
+
+### Run the demo
 
 ```bash
 streamlit run temporal_echo.py -- --web
 ```
 
-The application will open in your browser, where you can start the simulation and watch the Agent evolve its strategy in real-time.
+This will open the Streamlit UI where you can reset the model and run training loops. Use the animation preview to observe the agent and the ghost.
+
+---
 
 ## 📈 Training Progress
 
-The Agent's learning curve is characterized by two major jumps:
+* The app exposes metrics for **Timeline 1 Reward** and **Timeline 2 Reward** and a small line chart with recent timeline rewards.
+* Practical recommendations:
 
-1.  **Initial Spike:** Agent learns basic movement and navigation toward the button.
-2.  **Second Spike (The Breakthrough):** Agent successfully stabilizes a policy where Phase 1 hits the button, and Phase 2 utilizes the generated Ghost to reach the exit, leading to high, consistent rewards.
+  * Quick experiments: `train_iterations = 25`, `max_steps = 120`, `ppo_epochs = 6`, `entropy_coef = 0.02`.
+  * Serious training: `train_iterations = 200`, `max_steps = 160`, `ppo_epochs = 8`, run on GPU when possible.
+
+---
 
 ## ⚙️ Model Architecture
 
-The policy is an Actor-Critic architecture:
+**RecurrentActorCritic** (implemented with PyTorch) - summary:
 
-  * **Input State (6D Vector):** `[Agent_X, Agent_Y, Ghost_X, Ghost_Y, Button_Pressed, Barrier_Open]`
-  * **Shared Net:** 2x fully connected layers with Tanh activation.
-  * **Actor (Policy):** Outputs the mean and standard deviation for the 2D action vector (velocity).
-  * **Critic (Value):** Estimates the expected cumulative reward (Value function).
+* Input: 6-dimensional observation vector [`agent_x`, `agent_y`, `ghost_x`, `ghost_y`, `buttonA_pressed`, `buttonB_pressed`] normalized to [0, 1] by room size.
+* Body: Fully connected `Linear(obs_dim -> hidden)` + `Tanh`.
+* Memory: `LSTMCell(hidden -> hidden)` to handle temporal dependence within episodes.
+* Actor head: `Linear(hidden -> action_dim)` producing mean of Gaussian. Learned `log_std` parameter produces per-action variance.
+* Critic head: `Linear(hidden -> 1)` producing value estimate.
+
+### Extensions & Notes
+
+* The design is intentionally simple so it is easy to replace the body with a Transformer encoder that attends over a (short) window of ghost states. If you want to try that, replace the `fc_body` with a Transformer encoder or cross-attention block that consumes a compact representation of the ghost trajectory.
+* For larger-scale training, vectorized environments (multiple parallel rollouts) are strongly recommended.
+
+---
+
+## Troubleshooting & Tips
+
+* **Frontend JS error `First argument must be a String, HTMLElement...`**: This appears when embedding complex inline SVG repeatedly via `st.markdown` - the demo switches to PNG frames rendered via Matplotlib and uses `st.image` to avoid this error.
+* **No learning / negative rewards**: increase `train_iterations`, `max_steps`, or `ppo_epochs`; add entropy (`entropy_coef`) to encourage exploration; use the reward shaping suggested in the code. Consider curriculum training: first remove barrier or set the ghost to a trivial behavior so agent can learn basics.
+* **Reproducibility**: set the `seed` in `Config` and ensure PyTorch, NumPy, and random seeds are set at startup. For deterministic GPU behavior, set additional PyTorch flags (see PyTorch docs).
+
+---
+
+## Next Steps (suggested experiments)
+
+1. Vectorized rollout (`n_envs >= 8`) for higher data throughput.
+2. Replace `fc_body` with an attention module that receives a compressed ghost-trajectory embedding.
+3. Curriculum: train first without barrier, then gradually add barrier and increase required coordination.
+4. Save checkpoints & export best policy. Add a button in UI to download a GIF/MP4 of final episodes.
+
+---
 
 ## License
 
